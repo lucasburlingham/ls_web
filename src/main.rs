@@ -2,7 +2,7 @@ use std::{ fs, io::{ prelude::* }, net::{ TcpListener, TcpStream } };
 use colored::Colorize;
 
 fn main() {
-    let address = "127.0.0.1:7878";
+    let address = "0.0.0.0:7878";
     let listener = TcpListener::bind(address).unwrap();
     println!("{}{}", "Server started at: http://".green().bold(), address.green().bold());
     println!("Type {} to stop the server...", "CTRL+C".red().bold());
