@@ -12,7 +12,7 @@
 
 CARGO ?= cargo
 
-.PHONY: all help build run test fmt clippy check doc clean
+.PHONY: all help build run run-release release install test fmt clippy check doc clean
 
 all: build
 
@@ -23,6 +23,8 @@ help:
 	@echo "  release  - compile the project (optimized release)"
 	@echo "  run      - compile and run the project (debug)"
 	@echo "  run-release - compile and run the project (release)"
+	@echo "  release  - compile the project (optimized release)"
+	@echo "  install  - install the built binary to your cargo bin dir"
 	@echo "  test     - run tests"
 	@echo "  fmt      - format source with rustfmt"
 	@echo "  clippy   - run clippy lints (requires clippy component)"
@@ -41,6 +43,9 @@ run-release:
 
 release:
 	$(CARGO) build --release
+
+install:
+	$(CARGO) install --path . --locked --force
 
 test:
 	$(CARGO) test
