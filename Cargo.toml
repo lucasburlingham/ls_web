@@ -5,3 +5,8 @@ edition = "2021"
 
 [dependencies]
 colored = "2.1.0"
+urlencoding = "2.1.2"
+walkdir = "2.3"
+zip = "0.6"
+tar = "0.4"
+flate2 = "1.0"
