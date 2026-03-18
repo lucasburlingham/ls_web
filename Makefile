@@ -20,7 +20,9 @@ help:
 	@echo "Usage: make [target]"
 	@echo "Targets:"
 	@echo "  build    - compile the project (debug)"
+	@echo "  release  - compile the project (optimized release)"
 	@echo "  run      - compile and run the project (debug)"
+	@echo "  run-release - compile and run the project (release)"
 	@echo "  test     - run tests"
 	@echo "  fmt      - format source with rustfmt"
 	@echo "  clippy   - run clippy lints (requires clippy component)"
@@ -33,6 +35,12 @@ build:
 
 run:
 	$(CARGO) run
+
+run-release:
+	$(CARGO) run --release
+
+release:
+	$(CARGO) build --release
 
 test:
 	$(CARGO) test
