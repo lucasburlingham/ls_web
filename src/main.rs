@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     env,
     fs,
-    io::{ prelude::*, BufRead, BufReader, Cursor },
+    io::{ prelude::*, BufRead, BufReader },
     net::{ TcpListener, TcpStream },
     path::Path,
     process::Command,
@@ -115,77 +115,125 @@ fn handle_connection(mut stream: TcpStream, serve_dir: &str, sort_dirs_first: bo
     let method = parts.next().unwrap_or("");
     let raw_path = parts.next().unwrap_or("/");
 
-    if method != "GET" {
-        respond_with_status(
-            &mut stream,
-            "405 Method Not Allowed",
-            "Method not allowed",
-            "text/plain"
-        );
+    // Read headers
+    let mut headers = HashMap::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        if let Some((key, value)) = line.split_once(':') {
+            headers.insert(key.to_lowercase(), value.trim().to_string());
+        }
+    }
+
+    let mut body = Vec::new();
+    if method == "POST" {
+        if let Some(cl) = headers.get("content-length") {
+            if let Ok(len) = cl.trim().parse::<usize>() {
+                body.resize(len, 0);
+                let _ = reader.read_exact(&mut body);
+            }
+        }
+    }
+
+    if method == "GET" {
+        let mut parts = raw_path.splitn(2, '?');
+        let request_path = parts.next().unwrap_or("/");
+        let query = parts.next();
+
+        let request_path = if request_path.starts_with('/') {
+            &request_path[1..]
+        } else {
+            request_path
+        };
+
+        let request_path = decode(request_path).unwrap_or_else(|_| request_path.into());
+
+        let base_dir = Path::new(serve_dir);
+        let canonical_base = fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
+
+        // Download endpoint
+        if request_path.starts_with("download") {
+            handle_download(&mut stream, &canonical_base, query);
+            return;
+        }
+
+
+
+        let candidate = base_dir.join(&*request_path);
+        let canonical_path = fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+
+        if !canonical_path.starts_with(&canonical_base) {
+            respond_with_status(&mut stream, "403 Forbidden", "Forbidden", "text/plain");
+            return;
+        }
+
+        if canonical_path.is_dir() {
+            let request_url = if raw_path == "/" { "/" } else { raw_path };
+            let html = render_directory_listing(
+                &canonical_base,
+                &canonical_path,
+                request_url,
+                sort_dirs_first,
+            );
+            respond_with_status(&mut stream, "200 OK", &html, "text/html; charset=utf-8");
+            return;
+        }
+
+        if canonical_path.is_file() {
+            let file_name = canonical_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file");
+
+            if let Err(_) = respond_with_file_stream(
+                &mut stream,
+                &canonical_path,
+                file_name,
+                "application/octet-stream",
+            ) {
+                respond_with_status(&mut stream, "500 Internal Server Error", "Failed to read file", "text/plain");
+            }
+
+            return;
+        }
+
+        respond_with_status(&mut stream, "404 Not Found", "Not found", "text/plain");
         return;
     }
 
-    let mut parts = raw_path.splitn(2, '?');
-    let request_path = parts.next().unwrap_or("/");
-    let query = parts.next();
+    if method == "POST" {
+        let mut parts = raw_path.splitn(2, '?');
+        let request_path = parts.next().unwrap_or("/");
+        let query = parts.next();
 
-    let request_path = if request_path.starts_with('/') {
-        &request_path[1..]
-    } else {
-        request_path
-    };
+        let request_path = if request_path.starts_with('/') {
+            &request_path[1..]
+        } else {
+            request_path
+        };
 
-    let request_path = decode(request_path).unwrap_or_else(|_| request_path.into());
+        let request_path = decode(request_path).unwrap_or_else(|_| request_path.into());
 
-    let base_dir = Path::new(serve_dir);
-    let canonical_base = fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
+        let base_dir = Path::new(serve_dir);
+        let canonical_base = fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
 
-    // Download endpoint
-    if request_path.starts_with("download") {
-        handle_download(&mut stream, &canonical_base, query);
+        if request_path.starts_with("upload") {
+            handle_upload(&mut stream, &canonical_base, query, &body, headers.get("content-type").map(|s| s.as_str()));
+            return;
+        }
+
+        respond_with_status(&mut stream, "405 Method Not Allowed", "Method not allowed", "text/plain");
         return;
     }
 
-    let candidate = base_dir.join(&*request_path);
-    let canonical_path = fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
-
-    if !canonical_path.starts_with(&canonical_base) {
-        respond_with_status(&mut stream, "403 Forbidden", "Forbidden", "text/plain");
-        return;
-    }
-
-    if canonical_path.is_dir() {
-        let request_url = if raw_path == "/" { "/" } else { raw_path };
-        let html = render_directory_listing(
-            &canonical_base,
-            &canonical_path,
-            request_url,
-            sort_dirs_first,
-        );
-        respond_with_status(&mut stream, "200 OK", &html, "text/html; charset=utf-8");
-        return;
-    }
-
-    if canonical_path.is_file() {
-        let data = fs::read(&canonical_path).unwrap_or_default();
-        let file_name = canonical_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file");
-        let status_line = "HTTP/1.1 200 OK";
-        let content_disp = format!("attachment; filename=\"{}\"", file_name);
-        let response = format!(
-            "{status_line}\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nContent-Disposition: {}\r\n\r\n",
-            data.len(),
-            content_disp
-        );
-
-        stream.write_all(response.as_bytes()).unwrap();
-        stream.write_all(&data).unwrap();
-        return;
-    }
-
-    respond_with_status(&mut stream, "404 Not Found", "Not found", "text/plain");
+    respond_with_status(&mut stream, "405 Method Not Allowed", "Method not allowed", "text/plain");
 }
 
 fn render_directory_listing(
@@ -286,16 +334,36 @@ fn render_directory_listing(
     html.push_str(
         ".note {\n  margin-top: 1.8rem;\n  color: var(--muted);\n  font-size: 0.88rem;\n}\n"
     );
+    html.push_str(
+        ".dropzone {\n  border: 2px dashed rgba(0,0,0,0.2);\n  border-radius: 14px;\n  padding: 1.5rem;\n  margin-bottom: 1.5rem;\n  text-align: center;\n  color: rgba(0,0,0,0.55);\n  transition: background 120ms ease, border-color 120ms ease;\n}\n"
+    );
+    html.push_str(
+        ".dropzone.active {\n  background: rgba(0, 102, 204, 0.08);\n  border-color: rgba(0, 102, 204, 0.6);\n}\n"
+    );
     html.push_str("</style></head><body><div class=\"container\"> ");
     html.push_str("<h1>Directory listing</h1>");
     html.push_str("<div class=\"path\">");
     html.push_str(&abs_dir.display().to_string());
     html.push_str("</div>");
+
+    // Upload form
+    let encoded_path = urlencoding::encode(request_url);
+    let upload_url = format!("/upload?path={}", encoded_path);
+    html.push_str(&format!(
+        "<form action=\"{}\" method=\"post\" enctype=\"multipart/form-data\" style=\"margin-bottom: 1.25rem;\">",
+        upload_url
+    ));
+    html.push_str("<label style=\"font-weight: 600; margin-right: 0.5rem;\">Upload file: <input type=\"file\" name=\"file\" multiple></label>");
+    html.push_str("<button type=\"submit\" style=\"padding: 0.45rem 0.9rem; border-radius: 8px; border: 1px solid rgba(0,0,0,0.15); background: rgba(0,0,0,0.04); cursor: pointer;\">Upload</button>");
+    html.push_str("</form>");
+
+    html.push_str("<div id=\"dropZone\" class=\"dropzone\">Drag files here to upload</div>");
+
     html.push_str("<ul>");
     html.push_str(&items.join(""));
     html.push_str("</ul>");
     html.push_str(
-        "<div class=\"note\">Right-click an item to download the folder as an archive.</div>"
+        "<div class=\"note\">Right-click an item to download as an archive.</div>"
     );
     html.push_str("<div id=\"contextMenu\" class=\"context-menu\">");
     html.push_str("<button data-format=\"zip\">Download ZIP</button>");
@@ -319,15 +387,38 @@ fn render_directory_listing(
     html.push_str("    showMenu(event.pageX, event.pageY);");
     html.push_str("  });");
     html.push_str("  menu.addEventListener('click', (event) => {");
-    html.push_str("    const btn = event.target.closest('button[data-format]');");
+    html.push_str("    event.preventDefault();");
+    html.push_str("    event.stopPropagation();");
+    html.push_str("    const btn = event.target.closest('button');");
     html.push_str("    if (!btn) return;");
     html.push_str("    const format = btn.getAttribute('data-format');");
     html.push_str("    if (!format) return;");
-    html.push_str(
-        "    const url = `/download?path=${encodeURIComponent(currentPath)}&format=${encodeURIComponent(format)}`;"
-    );
-    html.push_str("    window.location.href = url;");
+    html.push_str("    const url = new URL('/download', window.location.origin);\n");
+    html.push_str("    url.searchParams.set('path', currentPath);\n");
+    html.push_str("    url.searchParams.set('format', format);\n");
+    html.push_str("    window.location.href = url;\n");
     html.push_str("  });");
+
+    // Drag-and-drop upload
+    html.push_str("  const dropZone = document.getElementById('dropZone');");
+    html.push_str(&format!(
+        "  const uploadUrl = \"{}\";",
+        upload_url
+    ));
+    html.push_str("  function setDropActive(active) { dropZone.classList.toggle('active', active); }");
+    html.push_str("  document.addEventListener('dragover', (e) => { e.preventDefault(); setDropActive(true); });");
+    html.push_str("  document.addEventListener('dragleave', (e) => { if (!e.relatedTarget || !dropZone.contains(e.relatedTarget)) setDropActive(false); });");
+    html.push_str("  document.addEventListener('drop', async (e) => {");
+    html.push_str("    e.preventDefault();");
+    html.push_str("    setDropActive(false);");
+    html.push_str("    const dt = e.dataTransfer;");
+    html.push_str("    if (!dt || !dt.files || dt.files.length === 0) return;");
+    html.push_str("    const form = new FormData();");
+    html.push_str("    for (const file of dt.files) form.append('file', file);");
+    html.push_str("    await fetch(uploadUrl, { method: 'POST', body: form });");
+    html.push_str("    window.location.reload();");
+    html.push_str("  });");
+
     html.push_str("})();");
     html.push_str("</script></body></html>");
 
@@ -381,47 +472,81 @@ fn handle_download(stream: &mut TcpStream, base_dir: &Path, query: Option<&str>)
 
     match format {
         "zip" => {
-            if let Ok(bytes) = archive_to_zip(&canonical_path) {
-                respond_with_bytes(stream, &bytes, &format!("{}.zip", name), "application/zip");
+            let mut out_path = std::env::temp_dir();
+            let stamp = std::time::SystemTime
+                ::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            out_path.push(format!("ls_web_{}.zip", stamp));
+
+            if create_zip_archive(&canonical_path, &out_path).is_ok() {
+                let _ = respond_with_file_stream(
+                    stream,
+                    &out_path,
+                    &format!("{}.zip", name),
+                    "application/zip",
+                );
+                let _ = fs::remove_file(&out_path);
             } else {
                 respond_with_status(
                     stream,
                     "500 Internal Server Error",
                     "Failed to create zip",
-                    "text/plain"
+                    "text/plain",
                 );
             }
         }
         "tar.gz" | "tgz" => {
-            if let Ok(bytes) = archive_to_targz(&canonical_path) {
-                respond_with_bytes(stream, &bytes, &format!("{}.tar.gz", name), "application/gzip");
+            let mut out_path = std::env::temp_dir();
+            let stamp = std::time::SystemTime
+                ::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            out_path.push(format!("ls_web_{}.tar.gz", stamp));
+
+            if create_targz_archive(&canonical_path, &out_path).is_ok() {
+                let _ = respond_with_file_stream(
+                    stream,
+                    &out_path,
+                    &format!("{}.tar.gz", name),
+                    "application/gzip",
+                );
+                let _ = fs::remove_file(&out_path);
             } else {
                 respond_with_status(
                     stream,
                     "500 Internal Server Error",
                     "Failed to create tar.gz",
-                    "text/plain"
+                    "text/plain",
                 );
             }
         }
         "7z" => {
-            match archive_to_7z(&canonical_path) {
-                Ok(bytes) => {
-                    respond_with_bytes(
-                        stream,
-                        &bytes,
-                        &format!("{}.7z", name),
-                        "application/x-7z-compressed"
-                    );
-                }
-                Err(_) => {
-                    respond_with_status(
-                        stream,
-                        "500 Internal Server Error",
-                        "Failed to create 7z archive (requires 7z binary)",
-                        "text/plain"
-                    );
-                }
+            let mut out_path = std::env::temp_dir();
+            let stamp = std::time::SystemTime
+                ::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            out_path.push(format!("ls_web_{}.7z", stamp));
+
+            if create_7z_archive(&canonical_path, &out_path).is_ok() {
+                let _ = respond_with_file_stream(
+                    stream,
+                    &out_path,
+                    &format!("{}.7z", name),
+                    "application/x-7z-compressed",
+                );
+                let _ = fs::remove_file(&out_path);
+            } else {
+                respond_with_status(
+                    stream,
+                    "500 Internal Server Error",
+                    "Failed to create 7z archive (requires 7z binary)",
+                    "text/plain",
+                );
             }
         }
         _ => {
@@ -430,67 +555,242 @@ fn handle_download(stream: &mut TcpStream, base_dir: &Path, query: Option<&str>)
     }
 }
 
-fn respond_with_bytes(stream: &mut TcpStream, bytes: &[u8], filename: &str, content_type: &str) {
+fn handle_upload(
+    stream: &mut TcpStream,
+    base_dir: &Path,
+    query: Option<&str>,
+    body: &[u8],
+    content_type: Option<&str>,
+) {
+    let params = parse_query(query.unwrap_or(""));
+    let request_path = params.get("path").map(|s| s.as_str()).unwrap_or("");
+
+    let request_path = request_path.trim_start_matches('/');
+    let target_dir = base_dir.join(request_path);
+
+    let canonical_base = fs::canonicalize(base_dir).unwrap_or_else(|_| base_dir.to_path_buf());
+    let canonical_target = fs::canonicalize(&target_dir).unwrap_or_else(|_| target_dir.clone());
+
+    if !canonical_target.starts_with(&canonical_base) {
+        respond_with_status(stream, "403 Forbidden", "Forbidden", "text/plain");
+        return;
+    }
+
+    if let Err(e) = fs::create_dir_all(&canonical_target) {
+        respond_with_status(
+            stream,
+            "500 Internal Server Error",
+            &format!("Failed to create upload directory: {e}"),
+            "text/plain",
+        );
+        return;
+    }
+
+    let boundary = content_type
+        .and_then(|ct| ct.split(';').find_map(|part| {
+            let part = part.trim();
+            if part.starts_with("boundary=") {
+                Some(part.trim_start_matches("boundary=").trim_matches('"').to_string())
+            } else {
+                None
+            }
+        }));
+
+    let boundary = if let Some(b) = boundary {
+        b
+    } else {
+        respond_with_status(
+            stream,
+            "400 Bad Request",
+            "Missing multipart boundary",
+            "text/plain",
+        );
+        return;
+    };
+
+    let files = parse_multipart(body, &boundary);
+    if files.is_empty() {
+        respond_with_status(
+            stream,
+            "400 Bad Request",
+            "No files uploaded",
+            "text/plain",
+        );
+        return;
+    }
+
+    for (filename, bytes) in files {
+        let safe_name = Path::new(&filename)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("upload.bin");
+        let dest = canonical_target.join(safe_name);
+        if let Err(e) = fs::write(&dest, &bytes) {
+            respond_with_status(
+                stream,
+                "500 Internal Server Error",
+                &format!("Failed to write file: {e}"),
+                "text/plain",
+            );
+            return;
+        }
+    }
+
+    let redirect_to = if request_path.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", request_path)
+    };
+
+    respond_with_redirect(stream, &redirect_to);
+}
+
+fn respond_with_redirect(stream: &mut TcpStream, location: &str) {
+    let response = format!(
+        "HTTP/1.1 303 See Other\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+    );
+    stream.write_all(response.as_bytes()).unwrap();
+}
+
+fn parse_multipart(body: &[u8], boundary: &str) -> Vec<(String, Vec<u8>)> {
+    let boundary = format!("--{}", boundary);
+    let boundary_bytes = boundary.as_bytes();
+    let mut parts = Vec::new();
+    let mut idx = 0;
+
+    while let Some(start) = find_subslice(&body[idx..], boundary_bytes) {
+        idx += start + boundary_bytes.len();
+
+        // Check for end boundary
+        if body.get(idx..idx + 2) == Some(b"--") {
+            break;
+        }
+
+        // Skip CRLF if present
+        if body.get(idx..idx + 2) == Some(b"\r\n") {
+            idx += 2;
+        }
+
+        // Read headers
+        let mut headers = HashMap::new();
+        while let Some(pos) = find_subslice(&body[idx..], b"\r\n") {
+            if pos == 0 {
+                idx += 2;
+                break;
+            }
+            let line = &body[idx..idx + pos];
+            if let Ok(line_str) = std::str::from_utf8(line) {
+                if let Some((k, v)) = line_str.split_once(':') {
+                    headers.insert(k.to_lowercase(), v.trim().to_string());
+                }
+            }
+            idx += pos + 2;
+        }
+
+        // Find next boundary
+        if let Some(next) = find_subslice(&body[idx..], boundary_bytes) {
+            let mut data = body[idx..idx + next].to_vec();
+            if data.ends_with(b"\r\n") {
+                data.truncate(data.len() - 2);
+            }
+
+            if let Some(disposition) = headers.get("content-disposition") {
+                if let Some(filename) = disposition
+                    .split(';')
+                    .find_map(|part| {
+                        let part = part.trim();
+                        if part.starts_with("filename=") {
+                            Some(
+                                part.trim_start_matches("filename=")
+                                    .trim_matches('"')
+                                    .to_string(),
+                            )
+                        } else {
+                            None
+                        }
+                    })
+                {
+                    parts.push((filename, data));
+                }
+            }
+
+            idx += next;
+            continue;
+        }
+
+        break;
+    }
+
+    parts
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn respond_with_file_stream(
+    stream: &mut TcpStream,
+    file_path: &Path,
+    filename: &str,
+    content_type: &str,
+) -> std::io::Result<()> {
+    let mut file = fs::File::open(file_path)?;
+    let len = file.metadata()?.len();
+
     let status_line = "HTTP/1.1 200 OK";
     let content_disp = format!("attachment; filename=\"{}\"", filename);
     let response = format!(
-        "{status_line}\r\nContent-Length: {}\r\nContent-Type: {content_type}\r\nContent-Disposition: {content_disp}\r\n\r\n",
-        bytes.len()
+        "{status_line}\r\nContent-Length: {len}\r\nContent-Type: {content_type}\r\nContent-Disposition: {content_disp}\r\n\r\n"
     );
-    stream.write_all(response.as_bytes()).unwrap();
-    stream.write_all(bytes).unwrap();
+
+    stream.write_all(response.as_bytes())?;
+    std::io::copy(&mut file, stream)?;
+    Ok(())
 }
 
-fn archive_to_zip(dir: &Path) -> std::io::Result<Vec<u8>> {
-    let mut buffer = Cursor::new(Vec::new());
-    {
-        let mut zip = ZipWriter::new(&mut buffer);
-        let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+fn create_zip_archive(dir: &Path, out_path: &Path) -> std::io::Result<()> {
+    let file = fs::File::create(out_path)?;
+    let mut zip = ZipWriter::new(file);
+    let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
-        for entry in WalkDir::new(dir) {
-            let entry = entry?;
-            let path = entry.path();
-            let name = path.strip_prefix(dir).unwrap();
-            if name.as_os_str().is_empty() {
-                continue;
-            }
-
-            let name_str = name.to_string_lossy();
-            if entry.file_type().is_dir() {
-                zip.add_directory(name_str.to_string(), options)?;
-            } else {
-                zip.start_file(name_str.to_string(), options)?;
-                let mut f = fs::File::open(path)?;
-                std::io::copy(&mut f, &mut zip)?;
-            }
+    for entry in WalkDir::new(dir) {
+        let entry = entry?;
+        let path = entry.path();
+        let name = path.strip_prefix(dir).unwrap();
+        if name.as_os_str().is_empty() {
+            continue;
         }
 
-        zip.finish()?;
+        let name_str = name.to_string_lossy();
+        if entry.file_type().is_dir() {
+            zip.add_directory(name_str.to_string(), options)?;
+        } else {
+            zip.start_file(name_str.to_string(), options)?;
+            let mut f = fs::File::open(path)?;
+            std::io::copy(&mut f, &mut zip)?;
+        }
     }
 
-    Ok(buffer.into_inner())
+    zip.finish()?;
+    Ok(())
 }
 
-fn archive_to_targz(dir: &Path) -> std::io::Result<Vec<u8>> {
-    let mut buffer = Vec::new();
-    {
-        let enc = GzEncoder::new(&mut buffer, Compression::default());
-        let mut tar = Builder::new(enc);
-        tar.append_dir_all(".", dir)?;
-        tar.finish()?;
-    }
-    Ok(buffer)
+fn create_targz_archive(dir: &Path, out_path: &Path) -> std::io::Result<()> {
+    let file = fs::File::create(out_path)?;
+    let enc = GzEncoder::new(file, Compression::default());
+    let mut tar = Builder::new(enc);
+    tar.append_dir_all(".", dir)?;
+    tar.finish()?;
+    Ok(())
 }
 
-fn archive_to_7z(dir: &Path) -> std::io::Result<Vec<u8>> {
-    let mut out_path = std::env::temp_dir();
-    let stamp = std::time::SystemTime
-        ::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    out_path.push(format!("ls_web_{}.7z", stamp));
-
+fn create_7z_archive(dir: &Path, out_path: &Path) -> std::io::Result<()> {
     let status = Command::new("7z")
         .arg("a")
         .arg("-t7z")
@@ -502,9 +802,7 @@ fn archive_to_7z(dir: &Path) -> std::io::Result<Vec<u8>> {
         return Err(std::io::Error::new(std::io::ErrorKind::Other, "7z command failed"));
     }
 
-    let bytes = fs::read(&out_path)?;
-    let _ = fs::remove_file(&out_path);
-    Ok(bytes)
+    Ok(())
 }
 fn respond_with_status(stream: &mut TcpStream, status: &str, body: &str, content_type: &str) {
     let response = format!(
