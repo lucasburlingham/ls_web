@@ -1,1 +1,8 @@
 /target
+/dist/
+/target/
+**/*.exe
+*.log
+node_modules/
+.idea/
+*.swp
